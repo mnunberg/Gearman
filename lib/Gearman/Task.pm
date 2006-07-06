@@ -20,12 +20,14 @@ sub new {
     my $opts = shift || {};
     for my $k (qw( uniq
                    on_complete on_fail on_retry on_status
-                   retry_count fail_after_idle high_priority
+                   retry_count timeout high_priority
                )) {
         $self->{$k} = delete $opts->{$k};
     }
 
     $self->{retry_count} ||= 0;
+
+    $self->{is_finished} = 0;  # bool: if success or fail has been called yet on this.
 
     if (%{$opts}) {
         Carp::croak("Unknown option(s): " . join(", ", sort keys %$opts));
@@ -34,6 +36,11 @@ sub new {
     $self->{retries_done} = 0;
 
     return $self;
+}
+
+sub is_finished {
+    my Gearman::Task $task = $_[0];
+    return $task->{is_finished};
 }
 
 sub taskset {
@@ -95,6 +102,7 @@ sub pack_submit_packet {
 
 sub fail {
     my Gearman::Task $task = shift;
+    return if $task->{is_finished};
 
     # try to retry, if we can
     if ($task->{retries_done} < $task->{retry_count}) {
@@ -104,6 +112,14 @@ sub fail {
         return $task->{taskset}->add_task($task);
     }
 
+    $task->final_fail;
+}
+
+sub final_fail {
+    my Gearman::Task $task = shift;
+    return if $task->{is_finished};
+    $task->{is_finished} = 1;
+
     return undef unless $task->{on_fail};
     $task->{on_fail}->();
     return undef;
@@ -111,13 +127,17 @@ sub fail {
 
 sub complete {
     my Gearman::Task $task = shift;
+    return if $task->{is_finished};
     return unless $task->{on_complete};
+
     my $result_ref = shift;
+    $task->{is_finished} = 1;
     $task->{on_complete}->($result_ref);
 }
 
 sub status {
     my Gearman::Task $task = shift;
+    return if $task->{is_finished};
     return unless $task->{on_status};
     my ($nu, $de) = @_;
     $task->{on_status}->($nu, $de);
@@ -218,11 +238,18 @@ Number of times job will be retried if there are failures.  Defaults to 0.
 Boolean, whether this job should take priority over other jobs already
 enqueued.
 
-=item * fail_after_idle
+=item * timeout
 
-Automatically fail after this many seconds have elapsed.  Defaults to 0,
-which means never.
+Automatically fail, calling your on_fail callback, after this many
+seconds have elapsed without an on_fail or on_complete being
+called. Defaults to 0, which means never.  Bypasses any retry_count
+remaining.
 
 =back
+
+=head2 $task->is_finished
+
+Returns bool: whether or not task is totally done (on_failure or
+on_complete callback has been called)
 
 =cut

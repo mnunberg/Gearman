@@ -76,11 +76,11 @@ is($client->do_task('fail_exit'), undef,
     'Job that failed via exit returned undef');
 pid_is_dead(wait());
 
-## Worker process times out (takes longer than fail_after_idle seconds).
+## Worker process times out (takes longer than timeout seconds).
 TODO: {
-    todo_skip 'fail_after_idle is not yet implemented', 1;
-    is($client->do_task('sleep', 5, { fail_after_idle => 3 }), undef,
-        'Job that timed out after 3 seconds returns failure (fail_after_idle)');
+    todo_skip 'timeout is not yet implemented', 1;
+    is($client->do_task('sleep', 5, { timeout => 3 }), undef,
+        'Job that timed out after 3 seconds returns failure');
 }
 
 ## Test retry_count.
@@ -144,6 +144,8 @@ do {
     $status = $client->get_status($handle);
 } until $status->percent == 1;
 
+
+
 sub pid_is_dead {
     my($pid) = @_;
     return if $pid == -1;
@@ -170,8 +172,6 @@ sub start_server {
                );
     my $server = first { -e $_ } @loc
         or return 0;
-
-    warn "FOUND server = $server\n";
 
     my $pid = start_child([ $server, '-p', $port ]);
     $Children{$pid} = 'S';
