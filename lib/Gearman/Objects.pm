@@ -5,6 +5,9 @@ use fields (
             'job_servers',
             'js_count',
             'sock_cache',  # hostport -> socket
+            'hooks',       # hookname -> coderef
+            'prefix',
+            'debug',
             );
 
 package Gearman::Taskset;
@@ -18,7 +21,8 @@ use fields (
             'default_sockaddr', # default socket's ip/port
 
             'loaned_sock',      # { hostport => socket }
-
+            'cancelled',        # bool, if taskset has been cancelled mid-processing
+            'hooks',       # hookname -> coderef
             );
 
 
@@ -48,6 +52,7 @@ use fields (
             'taskset',
             'jssock',  # jobserver socket.  shared by other tasks in the same taskset,
                        # but not w/ tasks in other tasksets using the same Gearman::Client
+            'hooks',       # hookname -> coderef
             );
 
 

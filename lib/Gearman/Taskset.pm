@@ -5,6 +5,8 @@ use Carp ();
 use Gearman::Client;
 use Gearman::Util;
 use Gearman::ResponseParser::Taskset;
+use Scalar::Util ();  # i thought about weakening taskset's client, but might be too weak.
+use Time::HiRes ();
 
 sub new {
     my $class = shift;
@@ -13,16 +15,20 @@ sub new {
     my $self = $class;
     $self = fields::new($class) unless ref $self;
 
-    $self->{waiting} = {};
+    $self->{waiting}     = {};
     $self->{need_handle} = [];
-    $self->{client} = $client;
+    $self->{client}      = $client;
     $self->{loaned_sock} = {};
+    $self->{cancelled}   = 0;
 
     return $self;
 }
 
 sub DESTROY {
     my Gearman::Taskset $ts = shift;
+
+    # During global cleanup this may be called out of order, and the client my not exist in the taskset.
+    return unless $ts->{client};
 
     if ($ts->{default_sock}) {
         $ts->{client}->_put_js_sock($ts->{default_sockaddr}, $ts->{default_sock});
@@ -31,6 +37,48 @@ sub DESTROY {
     while (my ($hp, $sock) = each %{ $ts->{loaned_sock} }) {
         $ts->{client}->_put_js_sock($hp, $sock);
     }
+}
+
+sub run_hook {
+    my Gearman::Taskset $self = shift;
+    my $hookname = shift || return;
+
+    my $hook = $self->{hooks}->{$hookname};
+    return unless $hook;
+
+    eval { $hook->(@_) };
+
+    warn "Gearman::Taskset hook '$hookname' threw error: $@\n" if $@;
+}
+
+sub add_hook {
+    my Gearman::Taskset $self = shift;
+    my $hookname = shift || return;
+
+    if (@_) {
+        $self->{hooks}->{$hookname} = shift;
+    } else {
+        delete $self->{hooks}->{$hookname};
+    }
+}
+
+sub cancel {
+    my Gearman::Taskset $ts = shift;
+
+    $ts->{cancelled} = 1;
+
+    if ($ts->{default_sock}) {
+        close($ts->{default_sock});
+        $ts->{default_sock} = undef;
+    }
+
+    while (my ($hp, $sock) = each %{ $ts->{loaned_sock} }) {
+        $sock->close;
+    }
+
+    $ts->{waiting}     = {};
+    $ts->{need_handle} = [];
+    $ts->{client}      = undef;
 }
 
 sub _get_loaned_sock {
@@ -49,6 +97,17 @@ sub _get_loaned_sock {
 sub wait {
     my Gearman::Taskset $ts = shift;
 
+    my %opts = @_;
+
+    my $timeout;
+    if (exists $opts{timeout}) {
+        $timeout = delete $opts{timeout};
+        $timeout += Time::HiRes::time();
+    }
+
+    Carp::carp "Unknown options: " . join(',', keys %opts) . " passed to Taskset->wait."
+        if keys %opts;
+
     my %parser;  # fd -> Gearman::ResponseParser object
 
     my ($rin, $rout, $eout) = ('', '', '');
@@ -62,10 +121,15 @@ sub wait {
     }
 
     my $tries = 0;
-    while (keys %{$ts->{waiting}}) {
+    while (!$ts->{cancelled} && keys %{$ts->{waiting}}) {
         $tries++;
 
-        my $nfound = select($rout=$rin, undef, $eout=$rin, 0.5);
+        my $time_left = $timeout ? $timeout - Time::HiRes::time() : 0.5;
+        my $nfound = select($rout=$rin, undef, $eout=$rin, $time_left);
+        if ($timeout && $time_left <= 0) {
+            $ts->cancel;
+            return;
+        }
         next if ! $nfound;
 
         foreach my $fd (keys %watching) {
@@ -84,8 +148,6 @@ sub wait {
             }
         }
 
-        # TODO: timeout jobs that have been running too long.  the _wait_for_packet
-        # loop only waits 0.5 seconds.
     }
 }
 
@@ -120,6 +182,8 @@ sub add_task {
         $task = Gearman::Task->new($func, $argref, $opts);
     }
     $task->taskset($ts);
+
+    $ts->run_hook('add_task', $ts, $task);
 
     my $req = $task->pack_submit_packet;
     my $len = length($req);

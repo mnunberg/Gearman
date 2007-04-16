@@ -4,6 +4,9 @@ use strict;
 use Carp ();
 use String::CRC32 ();
 
+use Gearman::Taskset;
+use Gearman::Util;
+
 # constructor, given: ($func, $argref, $opts);
 sub new {
     my $class = shift;
@@ -36,6 +39,29 @@ sub new {
     $self->{retries_done} = 0;
 
     return $self;
+}
+
+sub run_hook {
+    my Gearman::Task $self = shift;
+    my $hookname = shift || return;
+
+    my $hook = $self->{hooks}->{$hookname};
+    return unless $hook;
+
+    eval { $hook->(@_) };
+
+    warn "Gearman::Task hook '$hookname' threw error: $@\n" if $@;
+}
+
+sub add_hook {
+    my Gearman::Task $self = shift;
+    my $hookname = shift || return;
+
+    if (@_) {
+        $self->{hooks}->{$hookname} = shift;
+    } else {
+        delete $self->{hooks}->{$hookname};
+    }
 }
 
 sub is_finished {
@@ -93,9 +119,15 @@ sub pack_submit_packet {
          "submit_job_high" :
          "submit_job");
 
+    my $func = $task->{func};
+
+    if (my $prefix = $task->{taskset} && $task->{taskset}->{client} && $task->{taskset}->{client}->prefix) {
+        $func = join "\t", $prefix, $task->{func};
+    }
+
     return Gearman::Util::pack_req_command($mode,
                                            join("\0",
-                                                $task->{func} || '',
+                                                $func || '',
                                                 $task->{uniq} || '',
                                                 ${ $task->{argref} } || ''));
 }
@@ -122,9 +154,12 @@ sub final_fail {
     return if $task->{is_finished};
     $task->{is_finished} = $_[1] || 1;
 
+    $task->run_hook('final_fail', $task);
+
     $task->{on_fail}->()       if $task->{on_fail};
     $task->{on_post_hooks}->() if $task->{on_post_hooks};
     $task->wipe;
+
     return undef;
 }
 
@@ -134,6 +169,8 @@ sub complete {
 
     my $result_ref = shift;
     $task->{is_finished} = 'complete';
+
+    $task->run_hook('complete', $task);
 
     $task->{on_complete}->($result_ref) if $task->{on_complete};
     $task->{on_post_hooks}->()          if $task->{on_post_hooks};
@@ -170,6 +207,10 @@ sub wipe {
     }
 }
 
+sub func {
+    my Gearman::Task $task = shift;
+    return $task->{func};
+}
 1;
 __END__
 

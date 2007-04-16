@@ -1,3 +1,21 @@
+1.04 - 2007-04-16
+
+     -- Let Gearman::Worker use hostnames for job_servers (like
+        Gearman::Client does)  (Ask)
+
+     -- Add prefix setting to Gearman::Client and Gearman::Worker for simple
+        namespace separation of different instances of the same worker and
+        client code sharing job servers. (Ask Bjoern Hansen)
+
+     -- Refactor tests to have less duplicate code (Ask Bjoern Hansen)
+
+     -- Make Gearman::Client / Gearman::Worker tests use $^X instead
+        of hardcoded 'perl' to start gearmand (Ask Bjoern Hansen)
+
+1.03
+     -- Workers can now specify a timeout that when a task exceeds the time, the
+        jobserver will reassign the task and ignore results from the defunct job.
+
 1.02
      -- Task objects weren't reusable before anyway, and now they're really not:
         when they complete or fail, they wipe all their internal subref members

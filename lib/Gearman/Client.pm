@@ -5,7 +5,7 @@
 package Gearman::Client;
 
 our $VERSION;
-$VERSION = '1.02';
+$VERSION = '1.04';
 
 use strict;
 use IO::Socket::INET;
@@ -24,16 +24,24 @@ sub new {
     $self->{job_servers} = [];
     $self->{js_count} = 0;
     $self->{sock_cache} = {};
+    $self->{hooks} = {};
+    $self->{prefix} = '';
+
+    $self->debug($opts{debug}) if $opts{debug};
 
     $self->set_job_servers(@{ $opts{job_servers} })
         if $opts{job_servers};
+
+    $self->prefix($opts{prefix}) if $opts{prefix};
 
     return $self;
 }
 
 sub new_task_set {
     my Gearman::Client $self = shift;
-    return Gearman::Taskset->new($self);
+    my $taskset = Gearman::Taskset->new($self);
+    $self->run_hook('new_task_set', $self, $taskset);
+    return $taskset;
 }
 
 # getter/setter
@@ -115,6 +123,29 @@ sub dispatch_background {
     return "$jst//${$res->{blobref}}";
 }
 
+sub run_hook {
+    my Gearman::Client $self = shift;
+    my $hookname = shift || return;
+
+    my $hook = $self->{hooks}->{$hookname};
+    return unless $hook;
+
+    eval { $hook->(@_) };
+
+    warn "Gearman::Client hook '$hookname' threw error: $@\n" if $@;
+}
+
+sub add_hook {
+    my Gearman::Client $self = shift;
+    my $hookname = shift || return;
+
+    if (@_) {
+        $self->{hooks}->{$hookname} = shift;
+    } else {
+        delete $self->{hooks}->{$hookname};
+    }
+}
+
 sub get_status {
     my Gearman::Client $self = shift;
     my $handle = shift;
@@ -186,6 +217,18 @@ sub _get_random_js_sock {
     return ();
 }
 
+sub prefix {
+    my Gearman::Client $self = shift;
+    return $self->{prefix} unless @_;
+    $self->{prefix} = shift;
+}
+
+sub debug {
+    my Gearman::Client $self = shift;
+    $self->{debug} = shift if @_;
+    return $self->{debug} || 0;
+}
+
 1;
 __END__
 
@@ -239,6 +282,10 @@ settings in I<%options>, which can contain:
 Calls I<job_servers> (see below) to initialize the list of job
 servers.  Value in this case should be an arrayref.
 
+=item * prefix
+
+Calls I<prefix> (see below) to set the prefix / namespace.
+
 =back
 
 =head2 $client->job_servers(@servers)
@@ -290,6 +337,13 @@ Waits for a response from the job server for any of the tasks listed
 in the taskset. Will call the I<on_*> handlers for each of the tasks
 that have been completed, updated, etc.  Doesn't return until
 everything has finished running or failing.
+
+=head2 $client-E<gt>prefix($prefix)
+
+Sets the namespace / prefix for the function names. 
+
+See L<Gearman::Worker> for more details.
+
 
 =head1 EXAMPLES
 

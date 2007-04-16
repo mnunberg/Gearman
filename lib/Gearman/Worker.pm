@@ -5,7 +5,7 @@
 use strict;
 use Gearman::Util;
 use Carp ();
-use IO::Socket::INET;
+use IO::Socket::INET ();
 
 # this is the object that's handed to the worker subrefs
 package Gearman::Job;
@@ -52,6 +52,10 @@ sub arg {
     return ${ $self->{argref} };
 }
 
+sub handle {
+    my Gearman::Job $self = shift;
+    return $self->{handle};
+}
 
 package Gearman::Worker;
 use Socket qw(IPPROTO_TCP TCP_NODELAY SOL_SOCKET PF_INET SOCK_STREAM);
@@ -59,11 +63,14 @@ use Socket qw(IPPROTO_TCP TCP_NODELAY SOL_SOCKET PF_INET SOCK_STREAM);
 use fields (
             'job_servers',
             'js_count',
+            'prefix',
+            'debug',
             'sock_cache',        # host:port -> IO::Socket::INET
             'last_connect_fail', # host:port -> unixtime
             'down_since',        # host:port -> unixtime
             'connecting',        # host:port -> unixtime connect started at
             'can',               # func -> subref
+            'timeouts',          # func -> timeouts
             'client_id',         # random identifer string, no whitespace
             );
 
@@ -78,10 +85,16 @@ sub new {
     $self->{last_connect_fail} = {};
     $self->{down_since} = {};
     $self->{can} = {};
+    $self->{timeouts} = {};
     $self->{client_id} = join("", map { chr(int(rand(26)) + 97) } (1..30));
+    $self->{prefix}   = '';
+
+    $self->debug($opts{debug}) if $opts{debug};
 
     $self->job_servers(@{ $opts{job_servers} })
         if $opts{job_servers};
+
+    $self->prefix($opts{prefix}) if $opts{prefix};
 
     return $self;
 }
@@ -89,6 +102,8 @@ sub new {
 sub _get_js_sock {
     my Gearman::Worker $self = shift;
     my $ipport = shift;
+
+    warn "getting job server socket: $ipport" if $self->debug;
 
     if (my $sock = $self->{sock_cache}{$ipport}) {
         return $sock if getpeername($sock);
@@ -98,6 +113,8 @@ sub _get_js_sock {
     my $now = time;
     my $down_since = $self->{down_since}{$ipport};
     if ($down_since) {
+        warn "job server down since $down_since" if $self->debug;
+
         my $down_for = $now - $down_since;
         my $retry_period = $down_for > 60 ? 30 : (int($down_for / 2) + 1);
         if ($self->{last_connect_fail}{$ipport} > $now - $retry_period) {
@@ -105,10 +122,9 @@ sub _get_js_sock {
         }
     }
 
-    return undef unless $ipport =~ /(^\d+\..+):(\d+)/;
-    my ($ip, $port) = ($1, $2);
+    warn "connecting to '$ipport'" if $self->debug;
 
-    my $sock = IO::Socket::INET->new(PeerAddr => "$ip:$port",
+    my $sock = IO::Socket::INET->new(PeerAddr => $ipport,
                                      Timeout => 1);
     unless ($sock) {
         $self->{down_since}{$ipport} ||= $now;
@@ -127,7 +143,8 @@ sub _get_js_sock {
 
     # get this socket's state caught-up
     foreach my $func (keys %{$self->{can}}) {
-        unless (_set_capability($sock, $func, 1)) {
+        my $timeout = $self->{timeouts}->{$func};
+        unless ($self->_set_ability($sock, $func, $timeout)) {
             delete $self->{sock_cache}{$ipport};
             return undef;
         }
@@ -136,11 +153,18 @@ sub _get_js_sock {
     return $sock;
 }
 
-sub _set_capability {
-    my ($sock, $func, $can) = @_;
+sub _set_ability {
+    my Gearman::Worker $self = shift;
+    my ($sock, $func, $timeout) = @_;
 
-    my $req = Gearman::Util::pack_req_command($can ? "can_do" : "cant_do",
-                                              $func);
+    $func = join "\t", $self->prefix, $func if $self->prefix;
+
+    my $req;
+    if (defined $timeout) {
+        $req = Gearman::Util::pack_req_command("can_do_timeout", "$func\0$timeout");
+    } else {
+        $req = Gearman::Util::pack_req_command("can_do", $func);
+    }
     return Gearman::Util::send_req($sock, \$req);
 }
 
@@ -158,6 +182,7 @@ sub reset_abilities {
     }
 
     $self->{can} = {};
+    $self->{timeouts} = {};
 }
 
 # does one job and returns.  no return value.
@@ -165,6 +190,9 @@ sub work {
     my Gearman::Worker $self = shift;
     my %opts = @_;
     my $stop_if = delete $opts{'stop_if'} || sub { 0 };
+    my $complete_cb = delete $opts{on_complete};
+    my $fail_cb = delete $opts{on_fail};
+    my $start_cb = delete $opts{on_start};
     die "Unknown opts" if %opts;
 
     my $grab_req = Gearman::Util::pack_req_command("grab_job");
@@ -191,8 +219,9 @@ sub work {
                 next;
             }
 
-            my ($res, $err);
+            my $res;
             do {
+                my $err;
                 $res = Gearman::Util::read_res_packet($jss, \$err);
                 unless ($res) {
                     delete $self->{sock_cache}{$js};
@@ -214,23 +243,33 @@ sub work {
                 or die "Uh, regexp on job_assign failed";
             my ($handle, $func) = ($1, $2);
             my $job = Gearman::Job->new($func, $res->{'blobref'}, $handle, $jss);
+
+            my $jobhandle = "$js//" . $job->handle;
+            $start_cb->($jobhandle) if $start_cb;
+
             my $handler = $self->{can}{$func};
             my $ret = eval { $handler->($job); };
+            my $err = $@ || '';
+            warn "Job '$func' died: $err" if $err;
 
             my $work_req;
             if (defined $ret) {
-                $work_req = Gearman::Util::pack_req_command("work_complete", "$handle\0" . (ref $ret ? $$ret : $ret));
+                my $rv = ref $ret ? $$ret : $ret;
+                $work_req = Gearman::Util::pack_req_command("work_complete", "$handle\0$rv");
+                $complete_cb->($jobhandle, $ret) if $complete_cb;
             } else {
                 $work_req = Gearman::Util::pack_req_command("work_fail", $handle);
+                $fail_cb->($jobhandle, $err) if $fail_cb;
             }
 
             unless (Gearman::Util::send_req($jss, \$work_req)) {
                 delete $self->{sock_cache}{$js};
             }
-            return;
         }
 
+        my $is_idle = 0;
         if ($need_sleep) {
+            $is_idle = 1;
             my $wake_vec = '';
             foreach my $j (@jss) {
                 my ($js, $jss) = @$j;
@@ -243,10 +282,11 @@ sub work {
             }
 
             # chill for some arbitrary time until we're woken up again
-            select($wake_vec, undef, undef, 10);
+            my $nready = select($wake_vec, undef, undef, 10);
+            $is_idle = 0 if $nready;
         }
 
-        return if $stop_if->();
+        return if $stop_if->($is_idle);
     }
 
 }
@@ -254,9 +294,26 @@ sub work {
 sub register_function {
     my Gearman::Worker $self = shift;
     my $func = shift;
+    my $timeout = shift unless (ref $_[0] eq 'CODE');
     my $subref = shift;
 
-    my $req = Gearman::Util::pack_req_command("can_do", $func);
+    $func = join "\t", $self->prefix, $func if $self->prefix;
+
+    my $req;
+    if (defined $timeout) {
+        $req = Gearman::Util::pack_req_command("can_do_timeout", "$func\0$timeout");
+        $self->{timeouts}{$func} = $timeout;
+    } else {
+        $req = Gearman::Util::pack_req_command("can_do", $func);
+    }
+
+    $self->_register_all($req);
+    $self->{can}{$func} = $subref;
+}
+
+sub _register_all {
+    my Gearman::Worker $self = shift;
+    my $req = shift;
 
     foreach my $js (@{ $self->{job_servers} }) {
         my $jss = $self->_get_js_sock($js)
@@ -266,11 +323,9 @@ sub register_function {
             delete $self->{sock_cache}{$js};
         }
     }
-
-    $self->{can}{$func} = $subref;
 }
 
-# getter/setter
+# getters/setters
 sub job_servers {
     my Gearman::Worker $self = shift;
     return $self->{job_servers} unless @_;
@@ -282,6 +337,17 @@ sub job_servers {
     return $self->{job_servers} = $list;
 }
 
+sub prefix {
+    my Gearman::Worker $self = shift;
+    return $self->{prefix} unless @_;
+    $self->{prefix} = shift;
+}
+
+sub debug {
+    my Gearman::Worker $self = shift;
+    $self->{debug} = shift if @_;
+    return $self->{debug} || 0;
+}
 
 1;
 __END__
@@ -313,7 +379,7 @@ silently.
 
 =head1 USAGE
 
-=head2 Gearman::Worker->new(\%options)
+=head2 Gearman::Worker->new(%options)
 
 Creates a new I<Gearman::Worker> object, and returns the object.
 
@@ -325,6 +391,10 @@ settings in I<%options>, which can contain:
 =item * job_servers
 
 Calls I<job_servers> (see below) to initialize the list of job servers.
+
+=item * prefix
+
+Calls I<prefix> (see below) to set the prefix / namespace.
 
 =back
 
@@ -340,6 +410,8 @@ If the port number is not provided, 7003 is used as the default.
 
 =head2 $worker->register_function($funcname, $subref)
 
+=head2 $worker->register_function($funcname, $timeout, $subref)
+
 Registers the function I<$funcname> as being provided by the worker
 I<$worker>, and advertises these capabilities to all of the job servers
 defined in this worker.
@@ -349,8 +421,23 @@ worker receives a request for this function. It will be passed a
 I<Gearman::Job> object representing the job that has been received by the
 worker.
 
+I<$timeout> is an optional parameter specifying how long the jobserver will
+wait for your subroutine to give an answer. Exceeding this time will result
+in the jobserver reassigning the task and ignoring your result. This prevents
+a gimpy worker from ruining the 'user experience' in many situations.
+
 The subroutine reference can return a return value, which will be sent back
 to the job server.
+
+=head2 $client-E<gt>prefix($prefix)
+
+Sets the namespace / prefix for the function names.  This is useful
+for sharing job servers between different applications or different
+instances of the same application (different development sandboxes for
+example).
+
+The namespace is currently implemented as a simple tab separated
+concatentation of the prefix and the function name.
 
 =head2 Gearman::Job->arg
 
@@ -361,6 +448,11 @@ Returns the scalar argument that the client sent to the job server.
 Updates the status of the job (most likely, a long-running job) and sends
 it back to the job server. I<$numerator> and I<$denominator> should
 represent the percentage completion of the job.
+
+=head2 Gearman::Job->work(%opts)
+
+Do one job and returns (no value returned).
+You can pass "on_start" "on_complete" and "on_fail" callbacks in I<%opts>.
 
 =head1 EXAMPLES
 

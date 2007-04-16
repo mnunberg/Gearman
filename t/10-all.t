@@ -1,40 +1,39 @@
 #!/usr/bin/perl
 
 use strict;
-our $Bin;
-use FindBin qw( $Bin );
 use Gearman::Client;
 use Storable qw( freeze );
 use Test::More;
-use IO::Socket::INET;
-use POSIX qw( :sys_wait_h );
-use List::Util qw(first);;
-
-use constant PORT => 9000;
-our %Children;
-
-END { kill_children() }
+use lib 't';
+use TestGearman;
 
 if (start_server(PORT)) {
-    plan tests => 20;
+    plan tests => 32;
 } else {
     plan skip_all => "Can't find server to test with";
     exit 0;
 }
 
-start_server(PORT + 1);
+$NUM_SERVERS = 3;
 
-## Sleep, wait for servers to start up before connecting workers.
-wait_for_port(PORT);
-wait_for_port(PORT + 1);
+for (1..($NUM_SERVERS-1)) {
+    start_server(PORT + $_)
+}
 
-## Look for 2 job servers, starting at port number PORT.
-start_worker(PORT, 2);
-start_worker(PORT, 2);
+# kinda useless, now that start_server does this for us, but...
+for (0..($NUM_SERVERS-1)) {
+    ## Sleep, wait for servers to start up before connecting workers.
+    wait_for_port(PORT + $_);
+}
+
+## Start two workers, look for $NUM_SERVERS job servers, starting at
+## port number PORT.
+start_worker(PORT, $NUM_SERVERS);
+start_worker(PORT, $NUM_SERVERS);
 
 my $client = Gearman::Client->new;
 isa_ok($client, 'Gearman::Client');
-$client->job_servers('127.0.0.1:' . PORT, '127.0.0.1:' . (PORT + 1));
+$client->job_servers(map { '127.0.0.1:' . (PORT + $_) } 0..$NUM_SERVERS);
 
 eval { $client->do_task(sum => []) };
 like($@, qr/scalar or scalarref/, 'do_task does not accept arrayref argument');
@@ -83,6 +82,77 @@ TODO: {
         'Job that timed out after 3 seconds returns failure');
 }
 
+# Test sleeping less than the timeout
+is(${$client->do_task('sleep_three', '1:less')}, 'less',
+   'We took less time than the worker timeout');
+
+# Do it three more times to check that 'uniq' (implied '-')
+# works okay. 3 more because we need to go past the timeout.
+is(${$client->do_task('sleep_three', '1:one')}, 'one',
+   'We took less time than the worker timeout, again');
+
+is(${$client->do_task('sleep_three', '1:two')}, 'two',
+   'We took less time than the worker timeout, again');
+
+is(${$client->do_task('sleep_three', '1:three')}, 'three',
+   'We took less time than the worker timeout, again');
+
+# Now test if we sleep longer than the timeout
+is($client->do_task('sleep_three', 5), undef,
+   'We took more time than the worker timeout');
+
+# This task and the next one would be hashed with uniq onto the
+# previous task, except it failed, so make sure it doesn't happen.
+is($client->do_task('sleep_three', 5), undef,
+   'We took more time than the worker timeout, again');
+
+is($client->do_task('sleep_three', 5), undef,
+   'We took more time than the worker timeout, again, again');
+
+# Check hashing on success, first job sends in 'a' for argument, second job
+# should complete and return 'a' to the callback.
+{
+    my $tasks = $client->new_task_set;
+    $tasks->add_task('sleep_three', '2:a', {
+        uniq => 'something',
+        on_complete => sub { is(${$_[0]}, 'a', "'a' received") },
+        on_fail => sub { fail() },
+        });
+
+    sleep 1;
+
+    $tasks->add_task('sleep_three', '2:b', {
+        uniq => 'something',
+        on_complete => sub { is(${$_[0]}, 'a', "'a' received, we were hashed properly") },
+        on_fail => sub { fail() },
+        });
+
+    $tasks->wait;
+
+}
+
+# Check to make sure there are no hashing glitches with an explicit
+# 'uniq' field. Both should fail.
+{
+    my $tasks = $client->new_task_set;
+    $tasks->add_task('sleep_three', '10:a', {
+        uniq => 'something',
+        on_complete => sub { fail("This can't happen!") },
+        on_fail => sub { pass("We failed properly!") },
+        });
+
+    sleep 5;
+
+    $tasks->add_task('sleep_three', '10:b', {
+        uniq => 'something',
+        on_complete => sub { fail("This can't happen!") },
+        on_fail => sub { pass("We failed properly again!") },
+        });
+
+    $tasks->wait;
+
+}
+
 ## Test retry_count.
 my $retried = 0;
 is($client->do_task('fail' => '', {
@@ -107,7 +177,7 @@ is($failed, 1, 'on_fail called on failed result');
 ## In on_fail, add a new task with high priority set, and make sure it
 ## gets executed before task 4. To make this reliable, we need to first
 ## kill off all but one of the worker processes.
-my @worker_pids = grep $Children{$_} eq 'W', keys %Children;
+my @worker_pids = grep { $Children{$_} eq 'W' } keys %Children;
 kill INT => @worker_pids[1..$#worker_pids];
 $tasks = $client->new_task_set;
 $out = '';
@@ -116,7 +186,9 @@ $tasks->add_task(echo_ws => 2, { on_complete => sub { $out .= ${ $_[0] } } });
 $tasks->add_task(echo_ws => 'x', {
     on_fail => sub {
         $tasks->add_task(echo_ws => 'p', {
-            on_complete => sub { $out .= ${ $_[0] } },
+            on_complete => sub {
+                $out .= ${ $_[0] };
+            },
             high_priority => 1
         });
     },
@@ -134,11 +206,17 @@ respawn_children();
 $handle = $client->dispatch_background(long => undef, {
     on_complete => sub { $out = ${ $_[0] } },
 });
+
+# wait for job to start being processed:
+sleep 1;
+
 ok($handle, 'Got a handle back from dispatching background job');
 my $status = $client->get_status($handle);
 isa_ok($status, 'Gearman::JobStatus');
+ok($status->known, 'Job is known');
 ok($status->running, 'Job is still running');
 is($status->percent, .5, 'Job is 50 percent complete');
+
 do {
     sleep 1;
     $status = $client->get_status($handle);
@@ -146,69 +224,5 @@ do {
 
 
 
-sub pid_is_dead {
-    my($pid) = @_;
-    return if $pid == -1;
-    my $type = delete $Children{$pid};
-    if ($type eq 'W') {
-        ## Right now we can only restart workers.
-        start_worker(PORT, 2);
-    }
-}
 
-sub respawn_children {
-    for my $pid (keys %Children) {
-        if (waitpid($pid, WNOHANG) > 0) {
-            pid_is_dead($pid);
-        }
-    }
-}
 
-sub start_server {
-    my($port) = @_;
-    my @loc = ("$Bin/../../../../server/gearmand",  # using svn
-               '/usr/bin/gearmand',            # where some distros might put it
-               '/usr/sbin/gearmand',           # where other distros might put it
-               );
-    my $server = first { -e $_ } @loc
-        or return 0;
-
-    my $pid = start_child([ $server, '-p', $port ]);
-    $Children{$pid} = 'S';
-    return 1;
-}
-
-sub start_worker {
-    my($port, $num) = @_;
-    my $worker = "$Bin/worker.pl";
-    my $servers = join ',',
-                  map '127.0.0.1:' . (PORT + $_),
-                  0..$num-1;
-    my $pid = start_child([ $worker, '-s', $servers ]);
-    $Children{$pid} = 'W';
-}
-
-sub start_child {
-    my($cmd) = @_;
-    my $pid = fork();
-    die $! unless defined $pid;
-    unless ($pid) {
-        exec 'perl', '-Iblib/lib', '-Ilib', @$cmd or die $!;
-    }
-    $pid;
-}
-
-sub kill_children {
-    kill INT => keys %Children;
-}
-
-sub wait_for_port {
-    my($port) = @_;
-    my $start = time;
-    while (1) {
-        my $sock = IO::Socket::INET->new(PeerAddr => "127.0.0.1:$port");
-        return 1 if $sock;
-        select undef, undef, undef, 0.25;
-        die "Timeout waiting for port $port to startup" if time > $start + 5;
-    }
-}
