@@ -91,8 +91,13 @@ sub new {
 
     $self->debug($opts{debug}) if $opts{debug};
 
-    $self->job_servers(@{ $opts{job_servers} })
-        if $opts{job_servers};
+    if ($ENV{GEARMAN_WORKER_USE_STDIO}) {
+        open my $sock, '+<&', \*STDIN or die "Unable to dup STDIN to socket for worker to use.";
+        $self->{job_servers} = [ $sock ];
+        $self->{sock_cache}{$sock} = $sock;
+    } elsif ($opts{job_servers}) {
+        $self->job_servers(@{ $opts{job_servers} });
+    }
 
     $self->prefix($opts{prefix}) if $opts{prefix};
 
@@ -104,6 +109,14 @@ sub _get_js_sock {
     my $ipport = shift;
 
     warn "getting job server socket: $ipport" if $self->debug;
+
+    if (ref $ipport eq 'GLOB') {
+        if (my $sock = $self->{sock_cache}{$ipport}) {
+            return $sock;
+        } else {
+            die "Gearman server disappeared in STDIO mode.\n";
+        }
+    }
 
     if (my $sock = $self->{sock_cache}{$ipport}) {
         return $sock if getpeername($sock);
@@ -235,7 +248,14 @@ sub work {
                 next;
             }
 
-            die "Uh, wasn't expecting a $res->{type} packet" unless $res->{type} eq "job_assign";
+            unless ($res->{type} eq "job_assign") {
+                my $msg = "Uh, wasn't expecting a $res->{type} packet.";
+                if ($res->{type} eq "error") {
+                    $msg .= " [${$res->{blobref}}]\n";
+                    $msg =~ s/\0/ -- /g;
+                }
+                die $msg;
+            }
 
             $need_sleep = 0;
 
@@ -328,6 +348,7 @@ sub _register_all {
 # getters/setters
 sub job_servers {
     my Gearman::Worker $self = shift;
+    return if ($ENV{GEARMAN_WORKER_USE_STDIO});
     return $self->{job_servers} unless @_;
     my $list = [ @_ ];
     $self->{js_count} = scalar @$list;
@@ -390,7 +411,9 @@ settings in I<%options>, which can contain:
 
 =item * job_servers
 
-Calls I<job_servers> (see below) to initialize the list of job servers.
+Calls I<job_servers> (see below) to initialize the list of job
+servers. It will be ignored if this worker is running as a child
+process of a gearman server.
 
 =item * prefix
 
@@ -407,6 +430,9 @@ For example:
     $worker->job_servers('127.0.0.1', '192.168.1.100:7003');
 
 If the port number is not provided, 7003 is used as the default.
+
+Calling this method will do nothing in a worker that is running as a child
+process of a gearman server.
 
 =head2 $worker->register_function($funcname, $subref)
 
@@ -453,6 +479,16 @@ represent the percentage completion of the job.
 
 Do one job and returns (no value returned).
 You can pass "on_start" "on_complete" and "on_fail" callbacks in I<%opts>.
+
+=head1 WORKERS AS CHILD PROCESSES
+
+Gearman workers can be run run as child processes of a parent process
+which embeds L<Gearman::Server>.  When such a parent process
+fork/execs a worker, it sets the environment variable
+GEARMAN_WORKER_USE_STDIO to true before launching the worker. If this
+variable is set to true, then the jobservers function and option for
+new() are ignored and the unix socket bound to STDIN/OUT are used
+instead as the IO path to the gearman server.
 
 =head1 EXAMPLES
 

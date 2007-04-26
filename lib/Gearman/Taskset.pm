@@ -62,6 +62,17 @@ sub add_hook {
     }
 }
 
+# this method is part of the "Taskset" interface, also implemented by
+# Gearman::Client::Async, where no tasksets make sense, so instead the
+# Gearman::Client::Async object itself is also its taskset.  (the
+# client tracks all tasks).  so don't change this, without being aware
+# of Gearman::Client::Async.  similarly, don't access $ts->{client} without
+# going via this accessor.
+sub client {
+    my Gearman::Taskset $ts = shift;
+    return $ts->{client};
+}
+
 sub cancel {
     my Gearman::Taskset $ts = shift;
 
@@ -335,7 +346,7 @@ sub _process_packet {
         return 1;
     }
 
-    die "Unknown/unimplemented packet type: $res->{type}";
+    die "Unknown/unimplemented packet type: $res->{type} [${$res->{blobref}}]";
 
 }
 
