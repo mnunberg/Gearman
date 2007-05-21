@@ -36,6 +36,11 @@ our %cmd = (
             17 => [ 'O',  "echo_res" ],    # J->? TEXT
 
             19 => [ 'O',  "error" ],       # J->? ERRCODE[0]ERR_TEXT
+
+            # for worker to declare to the jobserver that this worker is only connected
+            # to one jobserver, so no polls/grabs will take place, and server is free
+            # to push "job_assign" packets back down.
+            24 => [ 'I', "all_yours" ],    # W->J ---
             );
 
 our %num;  # name -> num
@@ -63,6 +68,9 @@ sub pack_res_command {
     my $type_arg = shift;
     my $type = $num{$type_arg} || int($type_arg);
     die "Bogus type arg of '$type_arg'" unless $type;
+
+    # If they didn't pass in anything to send, make it be an empty string.
+    $_[0] = '' unless defined $_[0];
     my $len = length($_[0]);
     return "\0RES" . pack("NN", $type, $len) . $_[0];
 }
