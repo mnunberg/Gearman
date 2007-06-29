@@ -5,7 +5,7 @@
 package Gearman::Client;
 
 our $VERSION;
-$VERSION = '1.08';
+$VERSION = '1.09';
 
 use strict;
 use IO::Socket::INET;
@@ -369,5 +369,22 @@ integers.
 
 See the I<Gearman::Worker> documentation for the worker for the I<sum>
 function.
+
+=head1 COPYRIGHT
+
+Copyright 2006-2007 Six Apart, Ltd.
+
+License granted to use/distribute under the same terms as Perl itself.
+
+=head1 WARRANTY
+
+This is free software.  This comes with no warranty whatsoever.
+
+=head1 AUTHORS
+
+ Brad Fitzpatrick (brad@danga.com)
+ Jonathan Steinert (hachi@cpan.org)
+
+=cut
 
 =cut
