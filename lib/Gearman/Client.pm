@@ -1,11 +1,9 @@
 #!/usr/bin/perl
 
-#TODO: timeout isn't supported by this client API yet.
-
 package Gearman::Client;
 
 our $VERSION;
-$VERSION = '1.09';
+$VERSION = '1.10';
 
 use strict;
 use IO::Socket::INET;
@@ -26,11 +24,15 @@ sub new {
     $self->{sock_cache} = {};
     $self->{hooks} = {};
     $self->{prefix} = '';
+    $self->{exceptions} = 0;
 
     $self->debug($opts{debug}) if $opts{debug};
 
     $self->set_job_servers(@{ $opts{job_servers} })
         if $opts{job_servers};
+
+    $self->{exceptions} = delete $opts{exceptions}
+        if exists $opts{exceptions};
 
     $self->prefix($opts{prefix}) if $opts{prefix};
 
@@ -98,7 +100,7 @@ sub do_task {
 
     my $ts = $self->new_task_set;
     $ts->add_task($task);
-    $ts->wait;
+    $ts->wait(timeout => $task->timeout);
 
     return $did_err ? undef : $ret;
 
@@ -113,12 +115,13 @@ sub dispatch_background {
     my ($jst, $jss) = $self->_get_random_js_sock;
     return 0 unless $jss;
 
-    my $req = $task->pack_submit_packet("background");
+    my $req = $task->pack_submit_packet($self, "background");
     my $len = length($req);
     my $rv = $jss->write($req, $len);
 
     my $err;
     my $res = Gearman::Util::read_res_packet($jss, \$err);
+    $self->_put_js_sock($jst, $jss);
     return 0 unless $res && $res->{type} eq "job_created";
     return "$jst//${$res->{blobref}}";
 }
@@ -175,6 +178,28 @@ sub get_status {
     return Gearman::JobStatus->new(@args);
 }
 
+sub _option_request {
+    my Gearman::Client $self = shift;
+    my $sock = shift;
+    my $option = shift;
+
+    my $req = Gearman::Util::pack_req_command("option_req",
+                                              $option);
+    my $len = length($req);
+    my $rv = $sock->write($req, $len);
+
+    my $err;
+    my $res = Gearman::Util::read_res_packet($sock, \$err);
+
+    return unless $res;
+
+    return 0 if $res->{type} eq "error";
+    return 1 if $res->{type} eq "option_res";
+
+    warn "Got unknown response to option request: $res->{type}\n";
+    return;
+}
+
 # returns a socket from the cache.  it should be returned to the
 # cache with _put_js_sock.  the hostport isn't verified. the caller
 # should verify that $hostport is in the set of jobservers.
@@ -192,6 +217,14 @@ sub _get_js_sock {
 
     setsockopt($sock, IPPROTO_TCP, TCP_NODELAY, pack("l", 1)) or die;
     $sock->autoflush(1);
+
+    # If exceptions support is to be requested, and the request fails, disable
+    # exceptions for this client.
+    if ($self->{exceptions} && ! $self->_option_request($sock, 'exceptions')) {
+        warn "Exceptions support denied by server, disabling.\n";
+        $self->{exceptions} = 0;
+    }
+
     return $sock;
 }
 

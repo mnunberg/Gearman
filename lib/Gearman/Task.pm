@@ -7,6 +7,20 @@ use String::CRC32 ();
 use Gearman::Taskset;
 use Gearman::Util;
 
+BEGIN {
+    my $storable = eval { require Storable; 1 }
+    if !defined &RECEIVE_EXCEPTIONS || RECEIVE_EXCEPTIONS();
+
+    $storable ||= 0;
+
+    if (defined &RECEIVE_EXCEPTIONS) {
+        die "Exceptions support requires Storable: $@";
+    } else {
+        eval "sub RECEIVE_EXCEPTIONS () { $storable }";
+        die "Couldn't define RECEIVE_EXCEPTIONS: $@\n" if $@;
+    }
+}
+
 # constructor, given: ($func, $argref, $opts);
 sub new {
     my $class = shift;
@@ -22,8 +36,8 @@ sub new {
 
     my $opts = shift || {};
     for my $k (qw( uniq
-                   on_complete on_fail on_retry on_status
-                   retry_count timeout high_priority
+                   on_complete on_exception on_fail on_retry on_status
+                   retry_count timeout high_priority try_timeout
                )) {
         $self->{$k} = delete $opts->{$k};
     }
@@ -111,6 +125,7 @@ sub _hashfunc {
 
 sub pack_submit_packet {
     my Gearman::Task $task = shift;
+    my Gearman::Client $client = shift;
     my $is_background = shift;
 
     my $mode = $is_background ?
@@ -121,7 +136,7 @@ sub pack_submit_packet {
 
     my $func = $task->{func};
 
-    if (my $prefix = $task->{taskset} && $task->{taskset}->client && $task->{taskset}->client->prefix) {
+    if (my $prefix = $client && $client->prefix) {
         $func = join "\t", $prefix, $task->{func};
     }
 
@@ -134,6 +149,7 @@ sub pack_submit_packet {
 
 sub fail {
     my Gearman::Task $task = shift;
+    my $reason = shift;
     return if $task->{is_finished};
 
     # try to retry, if we can
@@ -144,7 +160,7 @@ sub fail {
         return $task->{taskset}->add_task($task);
     }
 
-    $task->final_fail;
+    $task->final_fail($reason);
 }
 
 sub final_fail {
@@ -156,11 +172,22 @@ sub final_fail {
 
     $task->run_hook('final_fail', $task);
 
-    $task->{on_fail}->()       if $task->{on_fail};
-    $task->{on_post_hooks}->() if $task->{on_post_hooks};
+    $task->{on_fail}->($reason) if $task->{on_fail};
+    $task->{on_post_hooks}->()  if $task->{on_post_hooks};
     $task->wipe;
 
     return undef;
+}
+
+sub exception {
+    my Gearman::Task $task = shift;
+
+    return unless RECEIVE_EXCEPTIONS;
+
+    my $exception_ref = shift;
+    my $exception = Storable::thaw($$exception_ref);
+    $task->{on_exception}->($$exception) if $task->{on_exception};
+    return;
 }
 
 sub complete {
@@ -202,7 +229,7 @@ sub set_on_post_hooks {
 
 sub wipe {
     my Gearman::Task $task = shift;
-    foreach my $f (qw(on_post_hooks on_complete on_fail on_retry on_status)) {
+    foreach my $f (qw(on_post_hooks on_complete on_fail on_retry on_status hooks)) {
         $task->{$f} = undef;
     }
 }
@@ -210,6 +237,12 @@ sub wipe {
 sub func {
     my Gearman::Task $task = shift;
     return $task->{func};
+}
+
+sub timeout {
+    my Gearman::Task $task = shift;
+    return $task->{timeout} unless @_;
+    return $task->{timeout} = shift;
 }
 1;
 __END__
@@ -303,6 +336,12 @@ Automatically fail, calling your on_fail callback, after this many
 seconds have elapsed without an on_fail or on_complete being
 called. Defaults to 0, which means never.  Bypasses any retry_count
 remaining.
+
+=item * try_timeout
+
+Automatically fail, calling your on_retry callback (or on_fail if out of
+retries), after this many seconds have elapsed. Defaults to 0, which means
+never.
 
 =back
 

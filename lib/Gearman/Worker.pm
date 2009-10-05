@@ -69,13 +69,27 @@ use fields (
             'last_connect_fail', # host:port -> unixtime
             'down_since',        # host:port -> unixtime
             'connecting',        # host:port -> unixtime connect started at
-            'can',               # func -> subref
-            'timeouts',          # func -> timeouts
+            'can',               # ability -> subref     (ability is func with optional prefix)
+            'timeouts',          # ability -> timeouts
             'client_id',         # random identifer string, no whitespace
             'parent_pipe',       # bool/obj:  if we're a child process of a gearman server,
                                  #   this is socket to our parent process.  also means parent
                                  #   sock can never disconnect or timeout, etc..
             );
+
+BEGIN {
+    my $storable = eval { require Storable; 1 }
+        if !defined &THROW_EXCEPTIONS || THROW_EXCEPTIONS();
+
+    $storable ||= 0;
+
+    if (defined &THROW_EXCEPTIONS) {
+        die "Exceptions support requires Storable: $@";
+    } else {
+        eval "sub THROW_EXCEPTIONS () { $storable }";
+        die "Couldn't define THROW_EXCEPTIONS: $@\n" if $@;
+    }
+}
 
 sub new {
     my ($class, %opts) = @_;
@@ -90,7 +104,7 @@ sub new {
     $self->{can} = {};
     $self->{timeouts} = {};
     $self->{client_id} = join("", map { chr(int(rand(26)) + 97) } (1..30));
-    $self->{prefix}   = '';
+    $self->{prefix}   = undef;
 
     $self->debug($opts{debug}) if $opts{debug};
 
@@ -113,6 +127,10 @@ sub new {
 sub _get_js_sock {
     my Gearman::Worker $self = shift;
     my $ipport = shift;
+    my %opts = @_;
+
+    my $on_connect = delete $opts{on_connect};
+    # Someday should warn when called with extra opts.
 
     warn "getting job server socket: $ipport" if $self->debug;
 
@@ -153,7 +171,7 @@ sub _get_js_sock {
 
     $self->{sock_cache}{$ipport} = $sock;
 
-    unless ($self->_on_connect($sock)) {
+    unless ($self->_on_connect($sock) && $on_connect && $on_connect->($sock)) {
         delete $self->{sock_cache}{$ipport};
         return undef;
     }
@@ -171,9 +189,9 @@ sub _on_connect {
     return undef unless Gearman::Util::send_req($sock, \$cid_req);
 
     # get this socket's state caught-up
-    foreach my $func (keys %{$self->{can}}) {
-        my $timeout = $self->{timeouts}->{$func};
-        unless ($self->_set_ability($sock, $func, $timeout)) {
+    foreach my $ability (keys %{$self->{can}}) {
+        my $timeout = $self->{timeouts}->{$ability};
+        unless ($self->_set_ability($sock, $ability, $timeout)) {
             return undef;
         }
     }
@@ -183,15 +201,13 @@ sub _on_connect {
 
 sub _set_ability {
     my Gearman::Worker $self = shift;
-    my ($sock, $func, $timeout) = @_;
-
-    $func = join "\t", $self->prefix, $func if $self->prefix;
+    my ($sock, $ability, $timeout) = @_;
 
     my $req;
     if (defined $timeout) {
-        $req = Gearman::Util::pack_req_command("can_do_timeout", "$func\0$timeout");
+        $req = Gearman::Util::pack_req_command("can_do_timeout", "$ability\0$timeout");
     } else {
-        $req = Gearman::Util::pack_req_command("can_do", $func);
+        $req = Gearman::Util::pack_req_command("can_do", $ability);
     }
     return Gearman::Util::send_req($sock, \$req);
 }
@@ -236,14 +252,32 @@ sub work {
 
     my $grab_req = Gearman::Util::pack_req_command("grab_job");
     my $presleep_req = Gearman::Util::pack_req_command("pre_sleep");
-    my %fd_map;
+
+    my $last_job_time;
+
+    # "Active" job servers are servers that have woken us up and should be
+    # queried to see if they have jobs for us to handle. On our first pass
+    # in the loop we contact all servers.
+    my %active_js = map { $_ => 1 } @{$self->{job_servers}};
+
+    # ( js => last_update_time, ... )
+    my %last_update_time;
 
     while (1) {
+        # "Jobby" job servers are the set of server which we will contact
+        # on this pass through the loop, because we need to clear and use
+        # the "Active" set to plan for our next pass through the loop.
+        my @jobby_js = keys %active_js;
 
-        my @jss;
-        my $need_sleep = 1;
+        %active_js = ();
 
-        foreach my $js (@{ $self->{job_servers} }) {
+        my $js_count = @jobby_js;
+        my $js_offset = int(rand($js_count));
+        my $is_idle = 0;
+
+        for (my $i = 0; $i < $js_count; $i++) {
+            my $js_index = ($i + $js_offset) % $js_count;
+            my $js = $jobby_js[$js_index];
             my $jss = $self->_get_js_sock($js)
                 or next;
 
@@ -259,6 +293,7 @@ sub work {
                     exit(0);
                 }
                 $self->uncache_sock($js, "grab_job_timeout");
+                delete $last_update_time{$js};
                 next;
             }
 
@@ -269,6 +304,7 @@ sub work {
             my $timeout = $self->{parent_pipe} ? 5 : 0.50;
             unless (Gearman::Util::wait_for_readability($jss->fileno, $timeout)) {
                 $self->uncache_sock($js, "grab_job_timeout");
+                delete $last_update_time{$js};
                 next;
             }
 
@@ -278,13 +314,17 @@ sub work {
                 $res = Gearman::Util::read_res_packet($jss, \$err);
                 unless ($res) {
                     $self->uncache_sock($js, "read_res_error");
+                    delete $last_update_time{$js};
                     next;
                 }
             } while ($res->{type} eq "noop");
 
-            push @jss, [$js, $jss];
-
             if ($res->{type} eq "no_job") {
+                unless (Gearman::Util::send_req($jss, \$presleep_req)) {
+                    delete $last_update_time{$js};
+                    $self->uncache_sock($js, "write_presleep_error");
+                }
+                $last_update_time{$js} = time;
                 next;
             }
 
@@ -297,20 +337,28 @@ sub work {
                 die $msg;
             }
 
-            $need_sleep = 0;
-
             ${ $res->{'blobref'} } =~ s/^(.+?)\0(.+?)\0//
                 or die "Uh, regexp on job_assign failed";
-            my ($handle, $func) = ($1, $2);
-            my $job = Gearman::Job->new($func, $res->{'blobref'}, $handle, $jss);
+            my ($handle, $ability) = ($1, $2);
+            my $job = Gearman::Job->new($ability, $res->{'blobref'}, $handle, $jss);
 
             my $jobhandle = "$js//" . $job->handle;
             $start_cb->($jobhandle) if $start_cb;
 
-            my $handler = $self->{can}{$func};
+            my $handler = $self->{can}{$ability};
             my $ret = eval { $handler->($job); };
-            my $err = $@ || '';
-            warn "Job '$func' died: $err" if $err;
+            my $err = $@;
+            warn "Job '$ability' died: $err" if $err;
+
+            $last_update_time{$js} = $last_job_time = time();
+
+            if (THROW_EXCEPTIONS && $err) {
+                my $exception_req = Gearman::Util::pack_req_command("work_exception", join("\0", $handle, Storable::nfreeze(\$err)));
+                unless (Gearman::Util::send_req($jss, \$exception_req)) {
+                    $self->uncache_sock($js, "write_res_error");
+                    next;
+                }
+            }
 
             my $work_req;
             if (defined $ret) {
@@ -324,29 +372,57 @@ sub work {
 
             unless (Gearman::Util::send_req($jss, \$work_req)) {
                 $self->uncache_sock($js, "write_res_error");
+                next;
             }
+
+            $active_js{$js} = 1;
         }
 
-        my $is_idle = 0;
-        if ($need_sleep) {
-            $is_idle = 1;
-            my $wake_vec = '';
+        my @jss;
+
+        my $on_connect = sub {
+            return Gearman::Util::send_req($_[0], \$presleep_req);
+        };
+
+        foreach my $js (@{$self->{job_servers}}) {
+            my $jss = $self->_get_js_sock($js, on_connect => $on_connect)
+                or next;
+            push @jss, [$js, $jss];
+        }
+
+        $is_idle = 1;
+        my $wake_vec = '';
+
+        foreach my $j (@jss) {
+            my ($js, $jss) = @$j;
+            my $fd = $jss->fileno;
+            vec($wake_vec, $fd, 1) = 1;
+        }
+
+        my $timeout = keys %active_js ? 0 : (10 + rand(2));
+
+
+        # chill for some arbitrary time until we're woken up again
+        my $nready = select(my $wout = $wake_vec, undef, undef, $timeout);
+
+        if ($nready) {
             foreach my $j (@jss) {
                 my ($js, $jss) = @$j;
-                unless (Gearman::Util::send_req($jss, \$presleep_req)) {
-                    $self->uncache_sock($js, "write_presleep_error");
-                    next;
-                }
                 my $fd = $jss->fileno;
-                vec($wake_vec, $fd, 1) = 1;
+                $active_js{$js} = 1
+                    if vec($wout, $fd, 1);
             }
-
-            # chill for some arbitrary time until we're woken up again
-            my $nready = select($wake_vec, undef, undef, 10);
-            $is_idle = 0 if $nready;
         }
 
-        return if $stop_if->($is_idle);
+        $is_idle = 0 if keys %active_js;
+
+        return if $stop_if->($is_idle, $last_job_time);
+
+        my $update_since = time - (15 + rand 60);
+
+        while (my ($js, $last_update) = each %last_update_time) {
+            $active_js{$js} = 1 if $last_update < $update_since;
+        }
     }
 
 }
@@ -357,18 +433,32 @@ sub register_function {
     my $timeout = shift unless (ref $_[0] eq 'CODE');
     my $subref = shift;
 
-    $func = join "\t", $self->prefix, $func if $self->prefix;
+    my $prefix = $self->prefix;
+    my $ability = defined($prefix) ? "$prefix\t$func" : "$func";
 
     my $req;
     if (defined $timeout) {
-        $req = Gearman::Util::pack_req_command("can_do_timeout", "$func\0$timeout");
-        $self->{timeouts}{$func} = $timeout;
+        $req = Gearman::Util::pack_req_command("can_do_timeout", "$ability\0$timeout");
+        $self->{timeouts}{$ability} = $timeout;
     } else {
-        $req = Gearman::Util::pack_req_command("can_do", $func);
+        $req = Gearman::Util::pack_req_command("can_do", $ability);
     }
 
     $self->_register_all($req);
-    $self->{can}{$func} = $subref;
+    $self->{can}{$ability} = $subref;
+}
+
+sub unregister_function {
+    my Gearman::Worker $self = shift;
+    my $func = shift;
+
+    my $prefix = $self->prefix;
+    my $ability = defined($prefix) ? "$prefix\t$func" : "$func";
+
+    my $req = Gearman::Util::pack_req_command("cant_do", $ability);
+
+    $self->_register_all($req);
+    delete $self->{can}{$ability};
 }
 
 sub _register_all {

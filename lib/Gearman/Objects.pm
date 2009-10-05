@@ -13,6 +13,7 @@ use fields (
             'hooks',       # hookname -> coderef
             'prefix',
             'debug',
+            'exceptions',
             );
 
 package Gearman::Taskset;
@@ -41,11 +42,13 @@ use fields (
             'uniq',
             'on_complete',
             'on_fail',
+            'on_exception',
             'on_retry',
             'on_status',
             'on_post_hooks',   # used internally, when other hooks are done running, prior to cleanup
             'retry_count',
             'timeout',
+            'try_timeout',
             'high_priority',
 
             # from server:

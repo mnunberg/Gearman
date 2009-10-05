@@ -20,6 +20,7 @@ sub new {
     $self->{client}      = $client;
     $self->{loaned_sock} = {};
     $self->{cancelled}   = 0;
+    $self->{hooks}       = {};
 
     return $self;
 }
@@ -113,7 +114,7 @@ sub wait {
     my $timeout;
     if (exists $opts{timeout}) {
         $timeout = delete $opts{timeout};
-        $timeout += Time::HiRes::time();
+        $timeout += Time::HiRes::time() if defined $timeout;
     }
 
     Carp::carp "Unknown options: " . join(',', keys %opts) . " passed to Taskset->wait."
@@ -196,7 +197,7 @@ sub add_task {
 
     $ts->run_hook('add_task', $ts, $task);
 
-    my $req = $task->pack_submit_packet;
+    my $req = $task->pack_submit_packet($ts->client);
     my $len = length($req);
     my $rv = $task->{jssock}->syswrite($req, $len);
     die "Wrote $rv but expected to write $len" unless $rv == $len;
@@ -325,6 +326,21 @@ sub _process_packet {
 
         $task->complete($res->{'blobref'});
         delete $ts->{waiting}{$shandle} unless @$task_list;
+
+        return 1;
+    }
+
+    if ($res->{type} eq "work_exception") {
+        ${ $res->{'blobref'} } =~ s/^(.+?)\0//
+            or die "Bogus work_exception from server";
+        my $shandle = $1;
+        my $task_list = $ts->{waiting}{$shandle} or
+            die "Uhhhh:  got work_exception for unknown handle: $shandle\n";
+
+        my Gearman::Task $task = $task_list->[0] or
+            die "Uhhhh:  task_list is empty on work_exception for handle $shandle\n";
+
+        $task->exception($res->{'blobref'});
 
         return 1;
     }

@@ -6,7 +6,7 @@ use strict;
 # O: out of job server
 # W: worker
 # C: client of job server
-# J : jobserver
+# J: jobserver
 our %cmd = (
             1 =>  [ 'I', "can_do" ],     # from W:  [FUNC]
             23 => [ 'I', "can_do_timeout" ], # from W: FUNC[0]TIMEOUT
@@ -14,6 +14,9 @@ our %cmd = (
             3 =>  [ 'I', "reset_abilities" ],  # from W:  ---
             22 => [ 'I', "set_client_id" ],    # W->J: [RANDOM_STRING_NO_WHITESPACE]
             4 =>  [ 'I', "pre_sleep" ],  # from W: ---
+
+            26 => [ 'I', "option_req" ], # C->J: [OPT]
+            27 => [ 'O', "option_res" ], # J->C: [OPT]
 
             6 =>  [ 'O', "noop" ],        # J->W  ---
             7 =>  [ 'I', "submit_job" ],    # C->J  FUNC[0]UNIQ[0]ARGS
@@ -28,6 +31,7 @@ our %cmd = (
             12 => [ 'IO',  "work_status" ],   # W->J/C: HANDLE[0]NUMERATOR[0]DENOMINATOR
             13 => [ 'IO',  "work_complete" ], # W->J/C: HANDLE[0]RES
             14 => [ 'IO',  "work_fail" ],     # W->J/C: HANDLE
+            25 => [ 'IO',  "work_exception" ], # W->J/C: HANDLE[0]EXCEPTION
 
             15 => [ 'I',  "get_status" ],  # C->J: HANDLE
             20 => [ 'O',  "status_res" ],  # C->J: HANDLE[0]KNOWN[0]RUNNING[0]NUM[0]DENOM
@@ -100,8 +104,20 @@ sub read_res_packet {
     return $err->("malformed_magic") unless $magic eq "\0RES";
 
     if ($len) {
-        $rv = sysread($sock, $buf, $len);
-        return $err->("short_body") unless $rv == $len;
+        # Start off trying to read the whole buffer. Store the bits in an array
+        # one element for each read, then do a big join at the end. This minimizes
+        # the number of memory allocations we have to do.
+        my $readlen = $len;
+        my $lim = 20 + int( $len / 2**10 );
+        my @buffers;
+        for (my $i = 0; $readlen > 0 && $i < $lim; $i++) {
+            my $rv = sysread($sock, $buffers[$i], $readlen);
+            return $err->("short_body") unless $rv > 0;
+            last unless $rv > 0;
+            $readlen -= $rv;
+        }
+        $buf = join('', @buffers);
+        return $err->("short_body") unless length($buf) == $len; 
     }
 
     $type = $cmd{$type};
