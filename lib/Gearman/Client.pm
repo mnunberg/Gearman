@@ -3,12 +3,12 @@
 package Gearman::Client;
 
 our $VERSION;
-$VERSION = '1.10';
+$VERSION = '1.11';
 
 use strict;
 use IO::Socket::INET;
 use Socket qw(IPPROTO_TCP TCP_NODELAY SOL_SOCKET);
-
+use UNIVERSAL qw(isa);
 use Gearman::Objects;
 use Gearman::Task;
 use Gearman::Taskset;
@@ -70,7 +70,7 @@ sub _get_task_from_args {
     my Gearman::Task $task;
     if (ref $_[0]) {
         $task = $_[0];
-        Carp::croak("Argument isn't a Gearman::Task") unless ref $_[0] eq "Gearman::Task";
+        Carp::croak("Argument isn't a Gearman::Task") unless isa(ref $_[0], "Gearman::Task");
     } else {
         my ($func, $arg_p, $opts) = @_;
         my $argref = ref $arg_p ? $arg_p : \$arg_p;
@@ -214,8 +214,7 @@ sub _get_js_sock {
     my $sock = IO::Socket::INET->new(PeerAddr => $hostport,
                                      Timeout => 1)
         or return undef;
-
-    setsockopt($sock, IPPROTO_TCP, TCP_NODELAY, pack("l", 1)) or die;
+	setsockopt($sock, SOL_SOCKET, TCP_NODELAY, pack("l", 1));
     $sock->autoflush(1);
 
     # If exceptions support is to be requested, and the request fails, disable

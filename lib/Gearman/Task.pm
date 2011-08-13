@@ -4,6 +4,9 @@ use strict;
 use Carp ();
 use String::CRC32 ();
 
+#for unique keys
+use Data::UUID;
+my $ug = Data::UUID->new();
 use Gearman::Taskset;
 use Gearman::Util;
 
@@ -22,6 +25,8 @@ BEGIN {
 }
 
 # constructor, given: ($func, $argref, $opts);
+my $ud = Data::UUID->new();
+
 sub new {
     my $class = shift;
 
@@ -41,7 +46,7 @@ sub new {
                )) {
         $self->{$k} = delete $opts->{$k};
     }
-
+	$self->{uniq} ||= $ug->create_str();
     $self->{retry_count} ||= 0;
 
     $self->{is_finished} = 0;  # bool: if success or fail has been called yet on this.
@@ -92,7 +97,6 @@ sub taskset {
     # setter
     my Gearman::Taskset $ts = shift;
     $task->{taskset} = $ts;
-
     my $merge_on = $task->{uniq} && $task->{uniq} eq "-" ?
         $task->{argref} : \ $task->{uniq};
     if ($$merge_on) {

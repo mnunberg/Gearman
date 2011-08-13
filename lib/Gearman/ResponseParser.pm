@@ -1,5 +1,6 @@
 package Gearman::ResponseParser;
 use strict;
+use POSIX;
 
 # this is an abstract base class.  See:
 #    Gearman::ResponseParser::Taskset  (for Gearman::Client, the sync version), or
@@ -105,14 +106,21 @@ sub eof {
 
 # don't override:
 sub parse_sock {
-    my ($self, $sock) = @_;  # $sock is readable, we should sysread it and feed it to $self->parse_data
-
+    my ($self, $sock) = @_;  # $sock is (MAYBE) readable,
+    #we should sysread it and feed it to $self->parse_data
+	my $block_prev = $sock->blocking;
+    $sock->blocking(0);
     my $data;
     my $rv = sysread($sock, $data, 128 * 1024);
-
+	$sock->blocking($block_prev);
     if (! defined $rv) {
-        $self->on_error("read_error: $!");
-        return;
+        if($! != EAGAIN && $! != EWOULDBLOCK) {   
+            $self->on_error("read_error: $!");
+            return;
+        } else {
+            print "EAGAIN\n";
+            return;
+        }
     }
 
     # FIXME:  EAGAIN , EWOULDBLOCK

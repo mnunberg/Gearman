@@ -1,6 +1,17 @@
 
 package Gearman::Util;
 use strict;
+use warnings;
+use Carp qw(carp);
+use POSIX;
+use Time::HiRes qw(time usleep);
+use Log::Fu;
+#carp "WARNING WARNING WARNING! this module is incomplete and inefficient. That " .
+#"being said, it should have eliminated *most* of the blocking code";
+
+our $Timeout = 1.0;
+our $MinBytesPerSecond = 1000;
+
 
 # I: to jobserver
 # O: out of job server
@@ -79,45 +90,77 @@ sub pack_res_command {
     return "\0RES" . pack("NN", $type, $len) . $_[0];
 }
 
+use constant {
+	SOCK_CLOSED => 1,
+	SOCK_ERR => 2,
+	SOCK_OK => 3,
+	NO_TIMEOUT => -1,
+};
+
+sub read_into_buf {
+	my ($sock,$nbytes,$timeout) = @_;
+	my $old_block = $sock->blocking;
+	$sock->blocking(0);
+	$timeout ||=$Timeout;
+	my $begin_time = Time::HiRes::time();
+	my $time_left = $timeout;
+	my $retcode = SOCK_OK;
+	my $buf = "";
+	log_debug("request for $nbytes bytes");
+	while (($time_left >= 0 || $timeout == NO_TIMEOUT) && $nbytes) {
+		$time_left = -(Time::HiRes::time() - $begin_time - $timeout);
+		my $rv = sysread($sock, my $tmp, $nbytes);
+		my $old_errno = $!;
+		if(!defined $rv) {
+			if(!defined $old_errno) {
+				carp "rv is undefined but errno is undefined too";
+			} elsif($old_errno == EAGAIN) {
+				usleep(500);
+				next;
+			}
+			$buf = undef;
+			$retcode = SOCK_ERR;
+			last;
+		} elsif ($rv == 0) {
+			log_debug("EOF");
+			$retcode = SOCK_CLOSED;
+			last;
+		}
+		$buf .= $tmp;
+		$nbytes -= $rv;
+	}
+	$sock->blocking($old_block);
+	log_debug("returning " . length($buf) . " bytes");
+	return ($buf,$retcode);
+}
+
 # returns undef on closed socket or malformed packet
 sub read_res_packet {
     my $sock = shift;
     my $err_ref = shift;
-
-    my $buf;
-    my $rv;
-
     my $err = sub {
         my $code = shift;
+		log_debug($code);
+        $sock->close() if $sock->connected;
         $$err_ref = $code if ref $err_ref;
         return undef;
     };
-
     # read the header
-    $rv = sysread($sock, $buf, 12);
-
-    return $err->("read_error")       unless defined $rv;
-    return $err->("eof")              unless $rv;
-    return $err->("malformed_header") unless $rv == 12;
-
-    my ($magic, $type, $len) = unpack("a4NN", $buf);
+	my ($hdr,$retcode) = read_into_buf($sock,12,$Timeout);
+    return $err->("read_error")       if ($retcode == SOCK_ERR);
+    #return $err->("eof")              if $retcode == SOCK_CLOSED;
+    return $err->("malformed_header") unless length($hdr) == 12;
+	
+    my ($magic, $type, $len) = unpack("a4NN", $hdr);
     return $err->("malformed_magic") unless $magic eq "\0RES";
-
+	
+	my $payload;
     if ($len) {
-        # Start off trying to read the whole buffer. Store the bits in an array
-        # one element for each read, then do a big join at the end. This minimizes
-        # the number of memory allocations we have to do.
-        my $readlen = $len;
-        my $lim = 20 + int( $len / 2**10 );
-        my @buffers;
-        for (my $i = 0; $readlen > 0 && $i < $lim; $i++) {
-            my $rv = sysread($sock, $buffers[$i], $readlen);
-            return $err->("short_body") unless $rv > 0;
-            last unless $rv > 0;
-            $readlen -= $rv;
-        }
-        $buf = join('', @buffers);
-        return $err->("short_body") unless length($buf) == $len; 
+		log_debug("trying to read payload");
+		my $timeout = $len / $MinBytesPerSecond;
+		($payload,$retcode) = read_into_buf($sock,$len,$timeout);
+		return $err->("read_error") if $retcode == SOCK_ERR;
+		return $err->("short_body") unless length($payload) == $len;
     }
 
     $type = $cmd{$type};
@@ -127,7 +170,7 @@ sub read_res_packet {
     return {
         'type' => $type->[1],
         'len' => $len,
-        'blobref' => \$buf,
+        'blobref' => \$payload,	
     };
 }
 

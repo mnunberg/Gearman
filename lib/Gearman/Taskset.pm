@@ -110,49 +110,59 @@ sub wait {
     my Gearman::Taskset $ts = shift;
 
     my %opts = @_;
-
     my $timeout;
     if (exists $opts{timeout}) {
         $timeout = delete $opts{timeout};
-        $timeout += Time::HiRes::time() if defined $timeout;
     }
 
     Carp::carp "Unknown options: " . join(',', keys %opts) . " passed to Taskset->wait."
         if keys %opts;
 
     my %parser;  # fd -> Gearman::ResponseParser object
-
-    my ($rin, $rout, $eout) = ('', '', '');
+    my ($rin,$rout,$eout) = ('','','','');
     my %watching;
-
     for my $sock ($ts->{default_sock}, values %{ $ts->{loaned_sock} }) {
         next unless $sock;
         my $fd = $sock->fileno;
         vec($rin, $fd, 1) = 1;
         $watching{$fd} = $sock;
     }
-
+    
     my $tries = 0;
+
+	my $begin_time = Time::HiRes::time();
+	my $time_left;
+	if($timeout) {
+		$time_left = sub { -(Time::HiRes::time() - $begin_time - $timeout) };
+	} else {
+		$time_left = sub { 0.5 };
+	}
+
     while (!$ts->{cancelled} && keys %{$ts->{waiting}}) {
         $tries++;
-
-        my $time_left = $timeout ? $timeout - Time::HiRes::time() : 0.5;
-        my $nfound = select($rout=$rin, undef, $eout=$rin, $time_left);
-        if ($timeout && $time_left <= 0) {
+		my $_tleft = $time_left->();
+        my $nfound = select($rout=$rin, undef, $eout=$rin, $_tleft);
+        if ($timeout && $_tleft <= 0) {
             $ts->cancel;
             return;
         }
         next if ! $nfound;
-
         foreach my $fd (keys %watching) {
+            if(vec($eout,$fd,1)) {
+                Carp::carp "Socket Error. Cancelling taskset";
+                $ts->cancel;
+                return;
+            }
             next unless vec($rout, $fd, 1);
             # TODO: deal with error vector
 
             my $sock   = $watching{$fd};
             my $parser = $parser{$fd} ||= Gearman::ResponseParser::Taskset->new(source  => $sock,
                                                                                 taskset => $ts);
+            #my $block_prev = $sock->blocking;
+            #$sock->blocking(0);
             eval { $parser->parse_sock($sock); };
-
+            #$sock->blocking($block_prev);
             if ($@) {
                 # TODO this should remove the fd from the list, and reassign any tasks to other jobserver, or bail.
                 # We're not in an accessable place here, so if all job servers fail we must die to prevent hanging.
@@ -199,6 +209,12 @@ sub add_task {
 
     my $req = $task->pack_submit_packet($ts->client);
     my $len = length($req);
+
+	if(!defined($task->{jssock})) {
+		#Carp::carp "task->{jssock} is undefined!";
+		return $task->fail;
+	}
+
     my $rv = $task->{jssock}->syswrite($req, $len);
     die "Wrote $rv but expected to write $len" unless $rv == $len;
 
@@ -208,7 +224,6 @@ sub add_task {
         if (! $rv) {
             shift @{ $ts->{need_handle} };  # ditch it, it failed.
             # this will resubmit it if it failed.
-            print " INITIAL SUBMIT FAILED\n";
             return $task->fail;
         }
     }

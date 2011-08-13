@@ -1,0 +1,37 @@
+=head1 DESCRIPTION
+
+This is a set of patched code and add in modules that improve (read, fix) the old
+Gearman:: Client/Worker/Task API.
+
+The modules contained are:
+
+=over
+
+=item L<Gearman::Healthtest>
+
+A healthtest module
+
+=item Nonblocking I/O
+
+The modules from 6apart use blocking I/O for operations. While it uses a select
+loop which should eliminate any type of blocking operations, there are writes
+to available-for-reading sockets and vice versa, in other words, a huge mess.
+The improvements in this module, while not complete, have shown an elimination
+of hanging code at gearman, perhaps at the cost of efficiency.
+
+Two variables are available with control the behavior of nonblocking I/O, which
+is still timeout-based:
+
+$Gearman::Util::Timeout: the default timeout value, normally 1.0
+$Gearman::Util::MinBytesPerSecond: the rate at which to set the timeout for
+payload i/o
+
+=item Unique UUIDs for Jobs
+
+The unpatched gearman modules have flakey behavior when it comes to unique IDs
+for jobs. For some reason this does not affect the jobs (or doesn't seem to do
+so) usually. However when using a persistent DB for a queue, there are fatal 
+consequences when UUIDs are not used. All jobs in the same queue are merged into
+one. The patched code ensures that the ID for a job will be a new UUID, unless 
+the calling code passes its own identifier. This behavior may change in the
+future
