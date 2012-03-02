@@ -2,7 +2,73 @@
 
 #TODO: retries?
 
+package Gearman::Worker::Abilities;
+# Little class for registration of abilities IN ORDER. order is important
+# because gearmand bases the way it orders functions on this.
 use strict;
+use warnings;
+sub new {
+    my $cls = shift;
+    my $self = [{},[]];
+    bless $self, $cls;
+    return $self;
+}
+
+sub by_name {
+    my ($self,$name) = @_;
+    my $idx = $self->[0]->{$name};
+    if (defined $idx) {
+        return $self->[1]->[$idx];
+    }
+}
+
+sub add {
+    my ($self,$name,$code) = @_;
+    if (defined $self->[0]->{$name}) {
+        return;
+    }
+    # find empty slot:
+    my $idx;
+    foreach my $i (0..@{$self->[1]}) {
+        if (! defined $self->[1]->[$i]) {
+            $idx = $i;
+            last;
+        }
+    }
+    $self->[0]->{$name} = $idx;
+    $self->[1]->[$idx] = $code;
+}
+
+sub remove {
+    my ($self,$name) = @_;
+    my $idx = $self->[0]->{$name};
+    my $ret;
+    if (defined $idx) {
+        $ret = delete $self->[1]->[$idx];
+        delete $self->[0]->{$name};
+    }
+    return $ret;
+}
+
+sub as_list {
+    my $self = shift;
+    my %rev = reverse %{$self->[0]};
+    
+    my @ret;
+    
+    while (my ($idx,$name) = each %rev) {
+        $ret[$idx] = $name if defined $self->[1]->[$idx];
+    }
+    
+    
+    @ret = grep $_, @ret;
+    return @ret;
+}
+
+use strict;
+use warnings;
+use Log::Fu;
+
 use Gearman::Util;
 use Carp ();
 use IO::Socket::INET ();
@@ -101,7 +167,7 @@ sub new {
     $self->{sock_cache} = {};
     $self->{last_connect_fail} = {};
     $self->{down_since} = {};
-    $self->{can} = {};
+    $self->{can} = Gearman::Worker::Abilities->new();
     $self->{timeouts} = {};
     $self->{client_id} = join("", map { chr(int(rand(26)) + 97) } (1..30));
     $self->{prefix}   = undef;
@@ -189,7 +255,7 @@ sub _on_connect {
     return undef unless Gearman::Util::send_req($sock, \$cid_req);
 
     # get this socket's state caught-up
-    foreach my $ability (keys %{$self->{can}}) {
+    foreach my $ability ($self->{can}->as_list) {
         my $timeout = $self->{timeouts}->{$ability};
         unless ($self->_set_ability($sock, $ability, $timeout)) {
             return undef;
@@ -225,7 +291,7 @@ sub reset_abilities {
         }
     }
 
-    $self->{can} = {};
+    $self->{can} = Gearman::Worker::Abilities->new();
     $self->{timeouts} = {};
 }
 
@@ -344,8 +410,8 @@ sub work {
 
             my $jobhandle = "$js//" . $job->handle;
             $start_cb->($jobhandle) if $start_cb;
-
-            my $handler = $self->{can}{$ability};
+            
+            my $handler = $self->{can}->by_name($ability);
             my $ret = eval { $handler->($job); };
             my $err = $@;
             warn "Job '$ability' died: $err" if $err;
@@ -445,7 +511,7 @@ sub register_function {
     }
 
     $self->_register_all($req);
-    $self->{can}{$ability} = $subref;
+    $self->{can}->add($ability, $subref);
 }
 
 sub unregister_function {
@@ -458,7 +524,7 @@ sub unregister_function {
     my $req = Gearman::Util::pack_req_command("cant_do", $ability);
 
     $self->_register_all($req);
-    delete $self->{can}{$ability};
+    $self->{can}->remove($ability);
 }
 
 sub _register_all {
